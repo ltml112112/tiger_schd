@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ETF 괴리율 트래커</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
+  @keyframes pulse-border { 0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,0.4)} 50%{box-shadow:0 0 0 6px rgba(245,158,11,0)} }
+  @keyframes spin { to{transform:rotate(360deg)} }
+  .shimmer { background:linear-gradient(90deg,#e5e7eb 25%,#f3f4f6 50%,#e5e7eb 75%); background-size:200% 100%; animation:shimmer 1.5s infinite; border-radius:6px; }
+  .auction-pulse { animation:pulse-border 1.5s ease-in-out infinite; }
+  .spin { animation:spin 1s linear infinite; }
+  .num { font-variant-numeric:tabular-nums; }
+  body { background:#f8fafc; }
+</style>
+</head>
+<body class="min-h-screen pb-8">
+
+<!-- Header -->
+<div class="bg-gray-900 text-white px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+  <div>
+    <div class="font-bold text-base leading-tight">ETF 괴리율 트래커</div>
+    <div class="text-gray-400 text-xs num" id="header-time">--:--:-- KST</div>
+  </div>
+  <div class="flex items-center gap-2">
+    <span id="market-badge" class="text-xs px-2 py-1 rounded-full bg-gray-700 text-gray-300">--</span>
+    <button id="btn-refresh" onclick="onManualRefresh()" class="bg-gray-700 hover:bg-gray-600 text-white text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 transition-colors">
+      <span id="refresh-icon">↻</span> 갱신
+    </button>
+  </div>
+</div>
+
+<!-- Auction Countdown -->
+<div id="auction-banner" class="hidden mx-4 mt-3 bg-amber-50 border border-amber-300 rounded-xl p-3 auction-pulse">
+  <div class="text-amber-700 font-semibold text-sm text-center">⚡ 동시호가 구간 (LP 미공급)</div>
+  <div id="auction-countdown" class="text-amber-900 font-bold text-2xl text-center num mt-1">--:--</div>
+</div>
+<div id="pre-banner" class="hidden mx-4 mt-3 bg-blue-50 border border-blue-200 rounded-xl p-3">
+  <div class="text-blue-700 text-sm text-center">동시호가까지 <span id="pre-countdown" class="font-bold num">--:--:--</span></div>
+</div>
+
+<!-- FX Card -->
+<div class="mx-4 mt-3 bg-white rounded-xl p-4 shadow-sm border border-gray-100">
+  <div class="text-gray-500 text-xs mb-1">💱 USD / KRW</div>
+  <div class="flex items-baseline gap-2">
+    <span id="fx-current" class="text-2xl font-bold text-gray-900 num">--</span>
+    <span id="fx-change" class="text-sm font-medium num">--</span>
+  </div>
+  <div class="text-gray-400 text-xs num mt-0.5">전일종가 <span id="fx-prev">--</span></div>
+</div>
+
+<!-- ETF Pair Cards -->
+<div id="etf-pairs"></div>
+
+<!-- Footer -->
+<div class="mx-4 mt-4 flex items-center justify-between text-xs text-gray-400">
+  <div class="flex items-center gap-1.5">
+    <span id="pulse-dot" class="w-2 h-2 rounded-full bg-green-400 inline-block"></span>
+    <span>최종 갱신: <span id="last-update" class="num">--</span></span>
+  </div>
+  <div id="error-badge" class="hidden text-red-500">⚠ API 오류</div>
+</div>
+
+<script>
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const PAIRS = [
+  { usSymbol:'SCHD', krCode:'458730', krName:'TIGER미국배당다우존스', color:'blue' },
+  { usSymbol:'QQQ',  krCode:'133690', krName:'TIGER나스닥100',       color:'purple' },
+  { usSymbol:'SPY',  krCode:'360750', krName:'TIGER미국S&P500',      color:'emerald' },
+];
+
+const THRESHOLDS = { strongPremium:1, premium:0.3, discount:-0.3, strongDiscount:-1 };
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+const state = {
+  fx: { current:null, prevClose:null, pctChange:null, source:null },
+  pairs: PAIRS.map(p => ({
+    usSymbol: p.usSymbol, krCode: p.krCode,
+    us: { current:null, prevClose:null, pctChange:null, sessionLabel:null, source:null },
+    kr: { current:null, prevClose:null, source:null, isManual:false },
+    nav: { estimated:null, deviation:null },
+  })),
+  ui: { refreshInterval:null, timerInterval:null, isRefreshing:false, errorCount:0 },
+};
+
+// ─── TIME UTILITIES ───────────────────────────────────────────────────────────
+function getKST() {
+  return new Date(Date.now() + 9 * 3600000);
+}
+
+function getMarketStatus() {
+  const kst = getKST();
+  const d = kst.getUTCDay(); // 0=Sun,6=Sat
+  if (d === 0 || d === 6) return 'closed';
+  const h = kst.getUTCHours(), m = kst.getUTCMinutes();
+  const t = h * 60 + m;
+  if (t < 8*60)          return 'pre';
+  if (t < 8*60+50)       return 'pre';
+  if (t < 9*60)          return 'auction';
+  if (t < 15*60+20)      return 'open';
+  if (t < 15*60+30)      return 'closing-auction';
+  if (t < 18*60)         return 'after';
+  return 'closed';
+}
+
+function getUSSessionLabel(meta) {
+  if (!meta) return '';
+  const state = meta.marketState || '';
+  if (state === 'PRE')  return '프리마켓';
+  if (state === 'POST') return '애프터마켓';
+  if (state === 'REGULAR') return '정규장';
+  return '종가';
+}
+
+function getBestUSPrice(meta) {
+  if (!meta) return null;
+  // prefer most recent off-hours price
+  if (meta.postMarketPrice > 0) return meta.postMarketPrice;
+  if (meta.preMarketPrice  > 0) return meta.preMarketPrice;
+  return meta.regularMarketPrice;
+}
+
+// ─── LOCALSTORAGE ─────────────────────────────────────────────────────────────
+function saveLS(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+function loadLS(key) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; }
+}
+
+function todayKST() {
+  const k = getKST();
+  return `${k.getUTCFullYear()}-${String(k.getUTCMonth()+1).padStart(2,'0')}-${String(k.getUTCDate()).padStart(2,'0')}`;
+}
+
+function loadPrevCloses() {
+  const today = todayKST();
+  // FX prevClose rolling strategy
+  const fxStored = loadLS('tiger_fx_ref');
+  if (fxStored) {
+    if (fxStored.date === today) {
+      state.fx.prevClose = fxStored.prevClose;
+    } else {
+      // yesterday's "current" becomes today's prevClose
+      state.fx.prevClose = fxStored.current;
+    }
+  }
+  // US ETF prevCloses
+  state.pairs.forEach(ps => {
+    const us = loadLS(`tiger_us_ref_${ps.usSymbol}`);
+    if (us) {
+      ps.us.prevClose = (us.date === today) ? us.prevClose : (us.current || us.prevClose);
+    }
+    const kr = loadLS(`tiger_kr_ref_${ps.krCode}`);
+    if (kr) {
+      ps.kr.prevClose = (kr.date === today) ? kr.prevClose : (kr.current || kr.prevClose);
+    }
+  });
+}
+
+function saveDailyRef(key, current, prevClose) {
+  const today = todayKST();
+  const existing = loadLS(key);
+  if (existing && existing.date === today) {
+    // same day: update current but keep prevClose
+    saveLS(key, { date:today, current, prevClose: existing.prevClose });
+  } else {
+    // new day: existing.current becomes prevClose
+    const pc = (existing && existing.current) ? existing.current : prevClose;
+    saveLS(key, { date:today, current, prevClose: pc });
+  }
+}
+
+// ─── CORS PROXY ───────────────────────────────────────────────────────────────
+async function proxyFetch(url) {
+  const proxies = [
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  ];
+  for (const makeProxy of proxies) {
+    try {
+      const r = await fetch(makeProxy(url), { signal: AbortSignal.timeout(9000) });
+      if (!r.ok) continue;
+      return await r.json();
+    } catch { /* try next */ }
+  }
+  // try direct as last resort
+  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+}
+
+// ─── API FETCHERS ─────────────────────────────────────────────────────────────
+async function fetchUSPrice(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
+  const data = await proxyFetch(url);
+  const meta = data?.chart?.result?.[0]?.meta;
+  if (!meta) throw new Error('No meta');
+  const current = getBestUSPrice(meta);
+  const prevClose = meta.chartPreviousClose || meta.previousClose;
+  const sessionLabel = getUSSessionLabel(meta);
+  return { current, prevClose, sessionLabel };
+}
+
+async function fetchKRPrice(code) {
+  const url = `https://m.stock.naver.com/api/stock/${code}/basic`;
+  const data = await proxyFetch(url);
+  // Naver returns closePrice as string with commas
+  const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
+  const current = parseNum(data?.closePrice || data?.nv);
+  // find prevClose from stockItemTotalInfos array
+  let prevClose = null;
+  const infos = data?.stockItemTotalInfos;
+  if (Array.isArray(infos)) {
+    const item = infos.find(i => i.code === '전일종가' || i.title === '전일종가');
+    if (item) prevClose = parseNum(item.value || item.val);
+  }
+  if (!prevClose) {
+    // fallback: subtract change from current
+    const change = parseNum(data?.compareToPreviousClosePrice || data?.cv);
+    if (current && change != null) prevClose = current - change;
+  }
+  return { current, prevClose };
+}
+
+async function fetchFX() {
+  const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`FX HTTP ${r.status}`);
+  const data = await r.json();
+  const current = data?.rates?.KRW;
+  if (!current) throw new Error('No KRW rate');
+  return { current };
+}
+
+// ─── FETCH ALL ────────────────────────────────────────────────────────────────
+async function fetchAllData() {
+  state.ui.isRefreshing = true;
+  setRefreshIcon(true);
+
+  const results = await Promise.allSettled([
+    fetchFX(),
+    ...state.pairs.map(ps => fetchUSPrice(ps.usSymbol)),
+    ...state.pairs.map(ps => fetchKRPrice(ps.krCode)),
+  ]);
+
+  const [fxRes, ...rest] = results;
+  const usResults = rest.slice(0, PAIRS.length);
+  const krResults = rest.slice(PAIRS.length);
+
+  // FX
+  if (fxRes.status === 'fulfilled') {
+    const { current } = fxRes.value;
+    // persist rolling ref
+    saveDailyRef('tiger_fx_ref', current, current);
+    // reload prevClose from fresh storage
+    const stored = loadLS('tiger_fx_ref');
+    state.fx.current = current;
+    state.fx.prevClose = stored?.prevClose || current;
+    state.fx.pctChange = state.fx.prevClose ? (current / state.fx.prevClose - 1) * 100 : 0;
+    state.fx.source = 'live';
+  } else {
+    state.fx.source = 'error';
+  }
+
+  // US ETFs
+  usResults.forEach((res, i) => {
+    const ps = state.pairs[i];
+    if (res.status === 'fulfilled') {
+      const { current, prevClose, sessionLabel } = res.value;
+      saveDailyRef(`tiger_us_ref_${ps.usSymbol}`, current, prevClose);
+      const stored = loadLS(`tiger_us_ref_${ps.usSymbol}`);
+      ps.us.current = current;
+      ps.us.prevClose = stored?.prevClose || prevClose;
+      ps.us.pctChange = ps.us.prevClose ? (current / ps.us.prevClose - 1) * 100 : 0;
+      ps.us.sessionLabel = sessionLabel;
+      ps.us.source = 'live';
+    } else {
+      ps.us.source = 'error';
+    }
+  });
+
+  // KR ETFs
+  krResults.forEach((res, i) => {
+    const ps = state.pairs[i];
+    if (res.status === 'fulfilled' && !ps.kr.isManual) {
+      const { current, prevClose } = res.value;
+      if (current) {
+        saveDailyRef(`tiger_kr_ref_${ps.krCode}`, current, prevClose);
+        const stored = loadLS(`tiger_kr_ref_${ps.krCode}`);
+        ps.kr.current = current;
+        ps.kr.prevClose = stored?.prevClose || prevClose;
+        ps.kr.source = 'live';
+      }
+    } else if (res.status === 'rejected') {
+      ps.kr.source = 'error';
+    }
+  });
+
+  state.pairs.forEach(calculateDeviation);
+
+  state.ui.isRefreshing = false;
+  state.ui.errorCount = results.filter(r => r.status === 'rejected').length;
+  renderAll();
+  setRefreshIcon(false);
+}
+
+// ─── CALCULATION ──────────────────────────────────────────────────────────────
+function calculateDeviation(ps) {
+  const { us, kr, nav } = ps;
+  const fxC = state.fx.current, fxP = state.fx.prevClose;
+  if (!us.current || !us.prevClose || !fxC || !fxP || !kr.prevClose) {
+    nav.estimated = null; nav.deviation = null; return;
+  }
+  nav.estimated = kr.prevClose * (us.current / us.prevClose) * (fxC / fxP);
+  if (kr.current) {
+    nav.deviation = (kr.current / nav.estimated - 1) * 100;
+  } else {
+    nav.deviation = null;
+  }
+}
+
+// ─── FORMAT HELPERS ───────────────────────────────────────────────────────────
+const fmtKRW = n => n == null ? '--' : '₩' + Math.round(n).toLocaleString('ko-KR');
+const fmtUSD = n => n == null ? '--' : '$' + n.toFixed(2);
+const fmtFX  = n => n == null ? '--' : n.toFixed(2);
+const fmtPct = n => n == null ? '--' : (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+
+function pctColor(n, strong=false) {
+  if (n == null) return 'text-gray-400';
+  if (n > 0) return strong ? 'text-red-600 font-semibold' : 'text-red-500';
+  if (n < 0) return strong ? 'text-green-600 font-semibold' : 'text-green-500';
+  return 'text-gray-500';
+}
+
+function deviationBg(d) {
+  if (d == null) return 'bg-gray-50 border-gray-200';
+  if (d >= THRESHOLDS.strongPremium)  return 'bg-red-50 border-red-200';
+  if (d >= THRESHOLDS.premium)        return 'bg-orange-50 border-orange-200';
+  if (d <= THRESHOLDS.strongDiscount) return 'bg-green-50 border-green-200';
+  if (d <= THRESHOLDS.discount)       return 'bg-emerald-50 border-emerald-200';
+  return 'bg-gray-50 border-gray-200';
+}
+
+function deviationTextColor(d) {
+  if (d == null) return 'text-gray-400';
+  if (d >= THRESHOLDS.strongPremium)  return 'text-red-600';
+  if (d >= THRESHOLDS.premium)        return 'text-orange-600';
+  if (d <= THRESHOLDS.strongDiscount) return 'text-green-700';
+  if (d <= THRESHOLDS.discount)       return 'text-emerald-600';
+  return 'text-gray-600';
+}
+
+function deviationLabel(d) {
+  if (d == null) return '계산 중...';
+  if (d >= THRESHOLDS.strongPremium)  return '강한 프리미엄 · 고평가';
+  if (d >= THRESHOLDS.premium)        return '프리미엄';
+  if (d <= THRESHOLDS.strongDiscount) return '강한 디스카운트 · 매수 기회 ✓';
+  if (d <= THRESHOLDS.discount)       return '디스카운트';
+  return '중립';
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+function buildETFCards() {
+  const container = document.getElementById('etf-pairs');
+  container.innerHTML = PAIRS.map((p, i) => `
+    <div id="card-${p.krCode}" class="mx-4 mt-3 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+      <!-- Header row -->
+      <div class="px-4 pt-3 pb-2 border-b border-gray-50 flex items-center justify-between">
+        <div>
+          <span class="font-semibold text-gray-800 text-sm">${p.krName}</span>
+          <span class="ml-1.5 text-gray-400 text-xs">${p.krCode}</span>
+        </div>
+        <span class="text-gray-400 text-xs">${p.usSymbol}</span>
+      </div>
+      <!-- US Price row -->
+      <div class="px-4 py-2 flex items-center justify-between border-b border-gray-50">
+        <span class="text-gray-500 text-xs">${p.usSymbol} <span id="us-label-${p.krCode}" class="text-gray-400"></span></span>
+        <div class="text-right">
+          <span id="us-price-${p.krCode}" class="font-bold text-gray-900 num">--</span>
+          <span id="us-change-${p.krCode}" class="ml-2 text-sm num">--</span>
+        </div>
+      </div>
+      <!-- Deviation box -->
+      <div id="dev-box-${p.krCode}" class="mx-4 my-3 rounded-xl border p-3 transition-all ${deviationBg(null)}">
+        <div class="flex items-baseline justify-between">
+          <span class="text-xs text-gray-500">괴리율</span>
+          <span id="dev-label-${p.krCode}" class="text-xs text-gray-400">${deviationLabel(null)}</span>
+        </div>
+        <div id="dev-pct-${p.krCode}" class="text-3xl font-bold num mt-1 ${deviationTextColor(null)}">--</div>
+        <div class="mt-2 grid grid-cols-2 gap-x-3 text-xs text-gray-500">
+          <div>한국 시장가 <span id="kr-price-${p.krCode}" class="float-right font-medium text-gray-700 num">--</span></div>
+          <div>추정 NAV <span id="nav-val-${p.krCode}" class="float-right font-medium text-gray-700 num">--</span></div>
+          <div class="mt-1">전일종가(한국) <span id="kr-prev-${p.krCode}" class="float-right num text-gray-400">--</span></div>
+          <div class="mt-1">FX 변동 <span id="fx-impact-${p.krCode}" class="float-right num text-gray-400">--</span></div>
+        </div>
+      </div>
+      <!-- Manual input -->
+      <div id="manual-row-${p.krCode}" class="px-4 pb-3 hidden">
+        <div class="text-xs text-gray-400 mb-1">⚠ 한국 가격 자동조회 실패 · 직접 입력</div>
+        <input type="number" inputmode="decimal" placeholder="예: 15250"
+          class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm num focus:outline-none focus:ring-1 focus:ring-blue-300"
+          oninput="onManualKRInput(${i}, this.value)">
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderFX() {
+  const { current, prevClose, pctChange } = state.fx;
+  setText('fx-current', current != null ? fmtFX(current) : '--');
+  setText('fx-prev', prevClose != null ? fmtFX(prevClose) : '--');
+  const el = document.getElementById('fx-change');
+  if (el) {
+    el.textContent = fmtPct(pctChange);
+    el.className = `text-sm font-medium num ${pctColor(pctChange)}`;
+  }
+}
+
+function renderPair(ps) {
+  const { krCode } = ps;
+  // US price
+  setText(`us-price-${krCode}`, fmtUSD(ps.us.current));
+  setText(`us-label-${krCode}`, ps.us.sessionLabel || '');
+  const usChEl = document.getElementById(`us-change-${krCode}`);
+  if (usChEl) { usChEl.textContent = fmtPct(ps.us.pctChange); usChEl.className = `text-sm num ${pctColor(ps.us.pctChange)}`; }
+
+  // Deviation box
+  const { estimated, deviation } = ps.nav;
+  const devBox = document.getElementById(`dev-box-${krCode}`);
+  if (devBox) devBox.className = `mx-4 my-3 rounded-xl border p-3 transition-all ${deviationBg(deviation)}`;
+  const devPct = document.getElementById(`dev-pct-${krCode}`);
+  if (devPct) { devPct.textContent = fmtPct(deviation); devPct.className = `text-3xl font-bold num mt-1 ${deviationTextColor(deviation)}`; }
+  setText(`dev-label-${krCode}`, deviationLabel(deviation));
+  setText(`kr-price-${krCode}`, fmtKRW(ps.kr.current));
+  setText(`nav-val-${krCode}`, fmtKRW(estimated));
+  setText(`kr-prev-${krCode}`, fmtKRW(ps.kr.prevClose));
+  const fxImpact = (state.fx.current && state.fx.prevClose)
+    ? (state.fx.current / state.fx.prevClose - 1) * 100 : null;
+  setText(`fx-impact-${krCode}`, fmtPct(fxImpact));
+
+  // Manual input visibility
+  const manualRow = document.getElementById(`manual-row-${krCode}`);
+  if (manualRow) manualRow.classList.toggle('hidden', ps.kr.source !== 'error' || ps.kr.isManual);
+
+  // Auction pulse on card
+  const card = document.getElementById(`card-${krCode}`);
+  if (card) card.classList.toggle('auction-pulse', getMarketStatus() === 'auction');
+}
+
+function renderMarketBadge() {
+  const s = getMarketStatus();
+  const badge = document.getElementById('market-badge');
+  if (!badge) return;
+  const map = {
+    'pre':            ['장 시작 전', 'bg-blue-100 text-blue-700'],
+    'auction':        ['⚡ 동시호가', 'bg-amber-100 text-amber-800'],
+    'open':           ['정규장 ●', 'bg-green-100 text-green-700'],
+    'closing-auction':['마감 동시호가', 'bg-amber-100 text-amber-800'],
+    'after':          ['장 후', 'bg-orange-100 text-orange-700'],
+    'closed':         ['장 마감', 'bg-gray-200 text-gray-600'],
+  };
+  const [label, cls] = map[s] || ['--', 'bg-gray-200 text-gray-500'];
+  badge.textContent = label;
+  badge.className = `text-xs px-2 py-1 rounded-full ${cls}`;
+}
+
+function renderCountdown() {
+  const kst = getKST();
+  const h = kst.getUTCHours(), m = kst.getUTCMinutes(), sec = kst.getUTCSeconds();
+  const nowSec = h * 3600 + m * 60 + sec;
+  const auctionStart = 8 * 3600 + 50 * 60;
+  const auctionEnd   = 9 * 3600;
+
+  const auctionBanner = document.getElementById('auction-banner');
+  const preBanner     = document.getElementById('pre-banner');
+
+  if (nowSec >= auctionStart && nowSec < auctionEnd) {
+    auctionBanner?.classList.remove('hidden');
+    preBanner?.classList.add('hidden');
+    const rem = auctionEnd - nowSec;
+    setText('auction-countdown', `${String(Math.floor(rem/60)).padStart(2,'0')}:${String(rem%60).padStart(2,'0')}`);
+  } else {
+    auctionBanner?.classList.add('hidden');
+    // show pre-countdown if within 30 min before auction
+    if (nowSec < auctionStart && nowSec >= auctionStart - 1800) {
+      preBanner?.classList.remove('hidden');
+      const rem = auctionStart - nowSec;
+      const hh = Math.floor(rem/3600), mm = Math.floor((rem%3600)/60), ss = rem%60;
+      setText('pre-countdown', `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`);
+    } else {
+      preBanner?.classList.add('hidden');
+    }
+  }
+
+  // Clock
+  setText('header-time', `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')} KST`);
+}
+
+function renderAll() {
+  renderFX();
+  state.pairs.forEach(renderPair);
+  renderMarketBadge();
+  const now = getKST();
+  const hh = String(now.getUTCHours()).padStart(2,'0');
+  const mm = String(now.getUTCMinutes()).padStart(2,'0');
+  const ss = String(now.getUTCSeconds()).padStart(2,'0');
+  setText('last-update', `${hh}:${mm}:${ss} KST`);
+  const errBadge = document.getElementById('error-badge');
+  if (errBadge) errBadge.classList.toggle('hidden', state.ui.errorCount === 0);
+}
+
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+// ─── EVENTS ───────────────────────────────────────────────────────────────────
+function onManualKRInput(idx, val) {
+  const ps = state.pairs[idx];
+  const n = parseFloat(val);
+  if (!isNaN(n) && n > 0) {
+    ps.kr.current = n;
+    ps.kr.isManual = true;
+    ps.kr.source = 'manual';
+    calculateDeviation(ps);
+    renderPair(ps);
+  }
+}
+
+function setRefreshIcon(loading) {
+  const icon = document.getElementById('refresh-icon');
+  if (!icon) return;
+  icon.className = loading ? 'spin inline-block' : '';
+  icon.textContent = loading ? '↻' : '↻';
+}
+
+let refreshInterval = null;
+function getRefreshMs() {
+  const s = getMarketStatus();
+  if (s === 'auction' || s === 'closing-auction') return 10000;
+  if (s === 'open') return 30000;
+  return 60000;
+}
+
+function startAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = setInterval(async () => {
+    await fetchAllData();
+    // adaptive: reschedule with new interval
+    startAutoRefresh();
+  }, getRefreshMs());
+}
+
+async function onManualRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  await fetchAllData();
+  startAutoRefresh();
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+async function init() {
+  buildETFCards();
+  loadPrevCloses();
+  setInterval(renderCountdown, 1000);
+  renderCountdown();
+  renderMarketBadge();
+  await fetchAllData();
+  startAutoRefresh();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
