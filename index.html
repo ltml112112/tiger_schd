@@ -43,7 +43,10 @@
 
 <!-- FX Card -->
 <div class="mx-4 mt-3 bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-  <div class="text-gray-500 text-xs mb-1">💱 USD / KRW</div>
+  <div class="flex items-center justify-between mb-1">
+    <span class="text-gray-500 text-xs">💱 USD / KRW</span>
+    <span id="fx-source-label" class="text-gray-400 text-xs">실시간</span>
+  </div>
   <div class="flex items-baseline gap-2">
     <span id="fx-current" class="text-2xl font-bold text-gray-900 num">--</span>
     <span id="fx-change" class="text-sm font-medium num">--</span>
@@ -226,12 +229,33 @@ async function fetchKRPrice(code) {
 }
 
 async function fetchFX() {
+  // Yahoo Finance USDKRW=X — same real-time source as US ETFs
+  try {
+    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/USDKRW=X?interval=1m&range=1d';
+    const data = await proxyFetch(url);
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (meta?.regularMarketPrice) {
+      return {
+        current:   meta.regularMarketPrice,
+        prevClose: meta.chartPreviousClose || meta.previousClose || null,
+      };
+    }
+  } catch { /* fall through */ }
+  // Fallback: Naver Finance FX
+  try {
+    const data = await proxyFetch('https://m.stock.naver.com/api/stock/FX_USDKRW/basic');
+    const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
+    const current = parseNum(data?.closePrice || data?.nv);
+    const change  = parseNum(data?.compareToPreviousClosePrice || data?.cv);
+    if (current) return { current, prevClose: (change != null) ? current - change : null };
+  } catch { /* fall through */ }
+  // Last resort: open.er-api.com (updates ~hourly)
   const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error(`FX HTTP ${r.status}`);
-  const data = await r.json();
-  const current = data?.rates?.KRW;
+  const d = await r.json();
+  const current = d?.rates?.KRW;
   if (!current) throw new Error('No KRW rate');
-  return { current };
+  return { current, prevClose: null };
 }
 
 // ─── FETCH ALL ────────────────────────────────────────────────────────────────
@@ -251,13 +275,18 @@ async function fetchAllData() {
 
   // FX
   if (fxRes.status === 'fulfilled') {
-    const { current } = fxRes.value;
-    // persist rolling ref
-    saveDailyRef('tiger_fx_ref', current, current);
-    // reload prevClose from fresh storage
-    const stored = loadLS('tiger_fx_ref');
+    const { current, prevClose: apiPrevClose } = fxRes.value;
     state.fx.current = current;
-    state.fx.prevClose = stored?.prevClose || current;
+    if (apiPrevClose) {
+      // Yahoo provides prevClose directly — use it as ground truth
+      state.fx.prevClose = apiPrevClose;
+      saveDailyRef('tiger_fx_ref', current, apiPrevClose);
+    } else {
+      // Fallback APIs don't provide prevClose — use localStorage rolling
+      saveDailyRef('tiger_fx_ref', current, current);
+      const stored = loadLS('tiger_fx_ref');
+      state.fx.prevClose = stored?.prevClose || current;
+    }
     state.fx.pctChange = state.fx.prevClose ? (current / state.fx.prevClose - 1) * 100 : 0;
     state.fx.source = 'live';
   } else {
@@ -408,9 +437,10 @@ function buildETFCards() {
 }
 
 function renderFX() {
-  const { current, prevClose, pctChange } = state.fx;
+  const { current, prevClose, pctChange, source } = state.fx;
   setText('fx-current', current != null ? fmtFX(current) : '--');
   setText('fx-prev', prevClose != null ? fmtFX(prevClose) : '--');
+  setText('fx-source-label', source === 'error' ? '⚠ 조회 실패' : '실시간');
   const el = document.getElementById('fx-change');
   if (el) {
     el.textContent = fmtPct(pctChange);
