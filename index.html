@@ -78,7 +78,7 @@ const THRESHOLDS = { strongPremium:1, premium:0.3, discount:-0.3, strongDiscount
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
-  fx: { current:null, prevClose:null, pctChange:null, source:null },
+  fx: { current:null, prevClose:null, pctChange:null, source:null, marketState:null },
   pairs: PAIRS.map(p => ({
     usSymbol: p.usSymbol, krCode: p.krCode,
     us: { current:null, prevClose:null, pctChange:null, sessionLabel:null, source:null },
@@ -179,83 +179,104 @@ function saveDailyRef(key, current, prevClose) {
 // ─── CORS PROXY ───────────────────────────────────────────────────────────────
 async function proxyFetch(url) {
   const proxies = [
-    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
   ];
+  let lastErr = 'unknown';
   for (const makeProxy of proxies) {
     try {
-      const r = await fetch(makeProxy(url), { signal: AbortSignal.timeout(9000) });
-      if (!r.ok) continue;
+      const r = await fetch(makeProxy(url), { signal: AbortSignal.timeout(6000) });
+      if (!r.ok) { lastErr = `HTTP ${r.status}`; continue; }
       return await r.json();
-    } catch { /* try next */ }
+    } catch (e) { lastErr = e.message || 'timeout'; }
   }
-  // try direct as last resort
-  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return await r.json();
+  throw new Error(`proxy fail: ${lastErr}`);
 }
 
 // ─── API FETCHERS ─────────────────────────────────────────────────────────────
-async function fetchUSPrice(symbol) {
+async function fetchYahoo(symbol) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
   const data = await proxyFetch(url);
   const meta = data?.chart?.result?.[0]?.meta;
-  if (!meta) throw new Error('No meta');
-  const current = getBestUSPrice(meta);
-  const prevClose = meta.chartPreviousClose || meta.previousClose;
-  const sessionLabel = getUSSessionLabel(meta);
-  return { current, prevClose, sessionLabel };
+  if (!meta) throw new Error(`No meta for ${symbol}`);
+  return meta;
+}
+
+async function fetchUSPrice(symbol) {
+  try {
+    const meta = await fetchYahoo(symbol);
+    return {
+      current: getBestUSPrice(meta),
+      prevClose: meta.chartPreviousClose || meta.previousClose,
+      sessionLabel: getUSSessionLabel(meta),
+    };
+  } catch (e) {
+    console.warn(`[US ${symbol}]`, e.message);
+    throw e;
+  }
 }
 
 async function fetchKRPrice(code) {
-  const url = `https://m.stock.naver.com/api/stock/${code}/basic`;
-  const data = await proxyFetch(url);
-  // Naver returns closePrice as string with commas
-  const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
-  const current = parseNum(data?.closePrice || data?.nv);
-  // find prevClose from stockItemTotalInfos array
-  let prevClose = null;
-  const infos = data?.stockItemTotalInfos;
-  if (Array.isArray(infos)) {
-    const item = infos.find(i => i.code === '전일종가' || i.title === '전일종가');
-    if (item) prevClose = parseNum(item.value || item.val);
-  }
-  if (!prevClose) {
-    // fallback: subtract change from current
-    const change = parseNum(data?.compareToPreviousClosePrice || data?.cv);
-    if (current && change != null) prevClose = current - change;
-  }
-  return { current, prevClose };
+  // Primary: Yahoo Finance .KS (unified, more stable proxy path)
+  try {
+    const meta = await fetchYahoo(`${code}.KS`);
+    if (meta?.regularMarketPrice) {
+      return {
+        current: meta.regularMarketPrice,
+        prevClose: meta.chartPreviousClose || meta.previousClose,
+      };
+    }
+  } catch (e) { console.warn(`[KR Yahoo ${code}]`, e.message); }
+
+  // Fallback: Naver Finance
+  try {
+    const data = await proxyFetch(`https://m.stock.naver.com/api/stock/${code}/basic`);
+    const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
+    const current = parseNum(data?.closePrice || data?.nv);
+    let prevClose = null;
+    const infos = data?.stockItemTotalInfos;
+    if (Array.isArray(infos)) {
+      const item = infos.find(i => i.code === '전일종가' || i.title === '전일종가');
+      if (item) prevClose = parseNum(item.value || item.val);
+    }
+    if (!prevClose) {
+      const change = parseNum(data?.compareToPreviousClosePrice || data?.cv);
+      if (current && change != null) prevClose = current - change;
+    }
+    if (current) return { current, prevClose };
+  } catch (e) { console.warn(`[KR Naver ${code}]`, e.message); }
+
+  throw new Error(`All sources failed for ${code}`);
 }
 
 async function fetchFX() {
   // Yahoo Finance USDKRW=X — same real-time source as US ETFs
   try {
-    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/USDKRW=X?interval=1m&range=1d';
-    const data = await proxyFetch(url);
-    const meta = data?.chart?.result?.[0]?.meta;
+    const meta = await fetchYahoo('USDKRW=X');
     if (meta?.regularMarketPrice) {
       return {
         current:   meta.regularMarketPrice,
         prevClose: meta.chartPreviousClose || meta.previousClose || null,
+        marketState: meta.marketState || null,
       };
     }
-  } catch { /* fall through */ }
+  } catch (e) { console.warn('[FX Yahoo]', e.message); }
   // Fallback: Naver Finance FX
   try {
     const data = await proxyFetch('https://m.stock.naver.com/api/stock/FX_USDKRW/basic');
     const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
     const current = parseNum(data?.closePrice || data?.nv);
     const change  = parseNum(data?.compareToPreviousClosePrice || data?.cv);
-    if (current) return { current, prevClose: (change != null) ? current - change : null };
-  } catch { /* fall through */ }
+    if (current) return { current, prevClose: (change != null) ? current - change : null, marketState: null };
+  } catch (e) { console.warn('[FX Naver]', e.message); }
   // Last resort: open.er-api.com (updates ~hourly)
   const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error(`FX HTTP ${r.status}`);
   const d = await r.json();
   const current = d?.rates?.KRW;
   if (!current) throw new Error('No KRW rate');
-  return { current, prevClose: null };
+  return { current, prevClose: null, marketState: null };
 }
 
 // ─── FETCH ALL ────────────────────────────────────────────────────────────────
@@ -275,14 +296,13 @@ async function fetchAllData() {
 
   // FX
   if (fxRes.status === 'fulfilled') {
-    const { current, prevClose: apiPrevClose } = fxRes.value;
+    const { current, prevClose: apiPrevClose, marketState } = fxRes.value;
     state.fx.current = current;
+    state.fx.marketState = marketState;
     if (apiPrevClose) {
-      // Yahoo provides prevClose directly — use it as ground truth
       state.fx.prevClose = apiPrevClose;
       saveDailyRef('tiger_fx_ref', current, apiPrevClose);
     } else {
-      // Fallback APIs don't provide prevClose — use localStorage rolling
       saveDailyRef('tiger_fx_ref', current, current);
       const stored = loadLS('tiger_fx_ref');
       state.fx.prevClose = stored?.prevClose || current;
@@ -291,6 +311,7 @@ async function fetchAllData() {
     state.fx.source = 'live';
   } else {
     state.fx.source = 'error';
+    console.warn('[FX all sources failed]', fxRes.reason?.message);
   }
 
   // US ETFs
@@ -307,6 +328,7 @@ async function fetchAllData() {
       ps.us.source = 'live';
     } else {
       ps.us.source = 'error';
+      console.warn(`[US ${ps.usSymbol} failed]`, res.reason?.message);
     }
   });
 
@@ -324,6 +346,7 @@ async function fetchAllData() {
       }
     } else if (res.status === 'rejected') {
       ps.kr.source = 'error';
+      console.warn(`[KR ${ps.krCode} failed]`, res.reason?.message);
     }
   });
 
@@ -437,10 +460,16 @@ function buildETFCards() {
 }
 
 function renderFX() {
-  const { current, prevClose, pctChange, source } = state.fx;
+  const { current, prevClose, pctChange, source, marketState } = state.fx;
   setText('fx-current', current != null ? fmtFX(current) : '--');
   setText('fx-prev', prevClose != null ? fmtFX(prevClose) : '--');
-  setText('fx-source-label', source === 'error' ? '⚠ 조회 실패' : '실시간');
+  let label = '실시간';
+  if (source === 'error') label = '⚠ 조회 실패';
+  else if (marketState && marketState !== 'REGULAR') {
+    const map = { CLOSED:'장 마감', PRE:'프리마켓', POST:'애프터마켓', PREPRE:'장 시작 전' };
+    label = map[marketState] || marketState;
+  }
+  setText('fx-source-label', label);
   const el = document.getElementById('fx-change');
   if (el) {
     el.textContent = fmtPct(pctChange);
