@@ -51,7 +51,7 @@
     <span id="fx-current" class="text-2xl font-bold text-gray-900 num">--</span>
     <span id="fx-change" class="text-sm font-medium num">--</span>
   </div>
-  <div class="text-gray-400 text-xs num mt-0.5">전일종가 <span id="fx-prev">--</span></div>
+  <div class="text-gray-400 text-xs num mt-0.5">어제 종가 <span id="fx-prev">--</span></div>
 </div>
 
 <!-- ETF Pair Cards -->
@@ -75,6 +75,7 @@ const PAIRS = [
 ];
 
 const THRESHOLDS = { strongPremium:1, premium:0.3, discount:-0.3, strongDiscount:-1 };
+const SIGNAL = { sell: 0.5, buy: -0.5 }; // 판단 기준: 0.5% 이상 벌어지면 액션
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
@@ -250,18 +251,48 @@ async function fetchKRPrice(code) {
   throw new Error(`All sources failed for ${code}`);
 }
 
+async function fetchUpbitUSDT() {
+  // Upbit KRW-USDT — 24/7 real-time, CORS-enabled. Best proxy for USD/KRW when FX is closed.
+  try {
+    const r = await fetch('https://api.upbit.com/v1/ticker?markets=KRW-USDT', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return null;
+    const arr = await r.json();
+    return arr?.[0]?.trade_price || null;
+  } catch (e) { console.warn('[Upbit USDT]', e.message); return null; }
+}
+
 async function fetchFX() {
-  // Yahoo Finance USDKRW=X — same real-time source as US ETFs
+  // Try Yahoo first to get real-time rate + prevClose baseline
+  let yahooCurrent = null, yahooPrev = null, yahooState = null;
   try {
     const meta = await fetchYahoo('USDKRW=X');
     if (meta?.regularMarketPrice) {
-      return {
-        current:   meta.regularMarketPrice,
-        prevClose: meta.chartPreviousClose || meta.previousClose || null,
-        marketState: meta.marketState || null,
-      };
+      yahooCurrent = meta.regularMarketPrice;
+      yahooPrev    = meta.chartPreviousClose || meta.previousClose || null;
+      yahooState   = meta.marketState || null;
     }
   } catch (e) { console.warn('[FX Yahoo]', e.message); }
+
+  // If FX market is CLOSED, prefer Upbit's 24/7 live USDT/KRW as "current"
+  // (Yahoo's price stays frozen at Friday close on weekends)
+  if (yahooState === 'CLOSED' || yahooState === 'POSTPOST') {
+    const upbit = await fetchUpbitUSDT();
+    if (upbit && yahooCurrent) {
+      return {
+        current:     upbit,
+        prevClose:   yahooCurrent, // compare live crypto price vs last FX close
+        marketState: 'CRYPTO_247',
+      };
+    }
+  }
+  if (yahooCurrent) {
+    return { current: yahooCurrent, prevClose: yahooPrev, marketState: yahooState };
+  }
+
+  // Yahoo entirely failed — try Upbit standalone (24/7)
+  const upbit = await fetchUpbitUSDT();
+  if (upbit) return { current: upbit, prevClose: null, marketState: 'CRYPTO_247' };
+
   // Fallback: Naver Finance FX
   try {
     const data = await proxyFetch('https://m.stock.naver.com/api/stock/FX_USDKRW/basic');
@@ -270,6 +301,7 @@ async function fetchFX() {
     const change  = parseNum(data?.compareToPreviousClosePrice || data?.cv);
     if (current) return { current, prevClose: (change != null) ? current - change : null, marketState: null };
   } catch (e) { console.warn('[FX Naver]', e.message); }
+
   // Last resort: open.er-api.com (updates ~hourly)
   const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error(`FX HTTP ${r.status}`);
@@ -413,6 +445,13 @@ function deviationLabel(d) {
   return '중립';
 }
 
+function signalInfo(d) {
+  if (d == null) return { label:'대기', cls:'bg-gray-100 text-gray-400', emoji:'⋯' };
+  if (d >= SIGNAL.sell) return { label:'매도 · 비싸다', cls:'bg-red-500 text-white', emoji:'💸' };
+  if (d <= SIGNAL.buy)  return { label:'매수 · 싸다',   cls:'bg-green-600 text-white', emoji:'💰' };
+  return { label:'관망', cls:'bg-gray-200 text-gray-600', emoji:'⏸' };
+}
+
 // ─── RENDER ───────────────────────────────────────────────────────────────────
 function buildETFCards() {
   const container = document.getElementById('etf-pairs');
@@ -436,16 +475,35 @@ function buildETFCards() {
       </div>
       <!-- Deviation box -->
       <div id="dev-box-${p.krCode}" class="mx-4 my-3 rounded-xl border p-3 transition-all ${deviationBg(null)}">
-        <div class="flex items-baseline justify-between">
+        <!-- Big BUY/SELL signal -->
+        <div id="signal-${p.krCode}" class="rounded-lg py-2.5 px-3 text-center font-bold text-lg bg-gray-100 text-gray-400">
+          <span id="signal-emoji-${p.krCode}">⋯</span>
+          <span id="signal-label-${p.krCode}">대기</span>
+        </div>
+        <!-- Deviation percent -->
+        <div class="flex items-baseline justify-between mt-3">
           <span class="text-xs text-gray-500">괴리율</span>
           <span id="dev-label-${p.krCode}" class="text-xs text-gray-400">${deviationLabel(null)}</span>
         </div>
-        <div id="dev-pct-${p.krCode}" class="text-3xl font-bold num mt-1 ${deviationTextColor(null)}">--</div>
-        <div class="mt-2 grid grid-cols-2 gap-x-3 text-xs text-gray-500">
-          <div>한국 시장가 <span id="kr-price-${p.krCode}" class="float-right font-medium text-gray-700 num">--</span></div>
-          <div>추정 NAV <span id="nav-val-${p.krCode}" class="float-right font-medium text-gray-700 num">--</span></div>
-          <div class="mt-1">전일종가(한국) <span id="kr-prev-${p.krCode}" class="float-right num text-gray-400">--</span></div>
-          <div class="mt-1">FX 변동 <span id="fx-impact-${p.krCode}" class="float-right num text-gray-400">--</span></div>
+        <div id="dev-pct-${p.krCode}" class="text-3xl font-bold num ${deviationTextColor(null)}">--</div>
+        <!-- Prices -->
+        <div class="mt-3 pt-2 border-t border-gray-200/60 space-y-1 text-sm">
+          <div class="flex justify-between">
+            <span class="text-gray-500">지금 가격</span>
+            <span id="kr-price-${p.krCode}" class="font-semibold text-gray-900 num">--</span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-500">적정 가격</span>
+            <span id="nav-val-${p.krCode}" class="font-semibold text-gray-900 num">--</span>
+          </div>
+          <div class="flex justify-between text-xs pt-1">
+            <span class="text-gray-400">어제 종가</span>
+            <span id="kr-prev-${p.krCode}" class="num text-gray-400">--</span>
+          </div>
+          <div class="flex justify-between text-xs">
+            <span class="text-gray-400">FX 변동</span>
+            <span id="fx-impact-${p.krCode}" class="num text-gray-400">--</span>
+          </div>
         </div>
       </div>
       <!-- Manual input -->
@@ -465,8 +523,9 @@ function renderFX() {
   setText('fx-prev', prevClose != null ? fmtFX(prevClose) : '--');
   let label = '실시간';
   if (source === 'error') label = '⚠ 조회 실패';
+  else if (marketState === 'CRYPTO_247') label = '실시간 (Upbit USDT)';
   else if (marketState && marketState !== 'REGULAR') {
-    const map = { CLOSED:'장 마감', PRE:'프리마켓', POST:'애프터마켓', PREPRE:'장 시작 전' };
+    const map = { CLOSED:'장 마감 · 금요일 종가', PRE:'프리마켓', POST:'애프터마켓', PREPRE:'장 시작 전' };
     label = map[marketState] || marketState;
   }
   setText('fx-source-label', label);
@@ -490,8 +549,14 @@ function renderPair(ps) {
   const devBox = document.getElementById(`dev-box-${krCode}`);
   if (devBox) devBox.className = `mx-4 my-3 rounded-xl border p-3 transition-all ${deviationBg(deviation)}`;
   const devPct = document.getElementById(`dev-pct-${krCode}`);
-  if (devPct) { devPct.textContent = fmtPct(deviation); devPct.className = `text-3xl font-bold num mt-1 ${deviationTextColor(deviation)}`; }
+  if (devPct) { devPct.textContent = fmtPct(deviation); devPct.className = `text-3xl font-bold num ${deviationTextColor(deviation)}`; }
   setText(`dev-label-${krCode}`, deviationLabel(deviation));
+  // Signal pill
+  const sig = signalInfo(deviation);
+  const sigEl = document.getElementById(`signal-${krCode}`);
+  if (sigEl) sigEl.className = `rounded-lg py-2.5 px-3 text-center font-bold text-lg ${sig.cls}`;
+  setText(`signal-emoji-${krCode}`, sig.emoji + ' ');
+  setText(`signal-label-${krCode}`, sig.label);
   setText(`kr-price-${krCode}`, fmtKRW(ps.kr.current));
   setText(`nav-val-${krCode}`, fmtKRW(estimated));
   setText(`kr-prev-${krCode}`, fmtKRW(ps.kr.prevClose));
