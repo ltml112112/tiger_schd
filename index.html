@@ -44,7 +44,7 @@
 <!-- FX Card -->
 <div class="mx-4 mt-3 bg-white rounded-xl p-4 shadow-sm border border-gray-100">
   <div class="flex items-center justify-between mb-1">
-    <span class="text-gray-500 text-xs">💱 USD / KRW</span>
+    <span class="text-gray-500 text-xs">💱 USD / KRW (실제 환율)</span>
     <span id="fx-source-label" class="text-gray-400 text-xs">실시간</span>
   </div>
   <div class="flex items-baseline gap-2">
@@ -52,6 +52,11 @@
     <span id="fx-change" class="text-sm font-medium num">--</span>
   </div>
   <div class="text-gray-400 text-xs num mt-0.5">어제 종가 <span id="fx-prev">--</span></div>
+  <!-- Upbit USDT + Kimchi Premium -->
+  <div class="mt-2 pt-2 border-t border-gray-100 flex items-center justify-between text-xs">
+    <div class="text-gray-500">🪙 Upbit USDT <span id="fx-upbit" class="ml-1 font-semibold text-gray-700 num">--</span></div>
+    <div class="text-gray-500">김프 <span id="fx-kimp" class="ml-1 font-semibold num">--</span></div>
+  </div>
 </div>
 
 <!-- ETF Pair Cards -->
@@ -79,7 +84,8 @@ const SIGNAL = { sell: 0.5, buy: -0.5 }; // 판단 기준: 0.5% 이상 벌어지
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
-  fx: { current:null, prevClose:null, pctChange:null, source:null, marketState:null },
+  fx: { current:null, prevClose:null, pctChange:null, source:null, marketState:null,
+        upbitUSDT:null, kimp:null },
   pairs: PAIRS.map(p => ({
     usSymbol: p.usSymbol, krCode: p.krCode,
     us: { current:null, prevClose:null, pctChange:null, sessionLabel:null, source:null },
@@ -178,8 +184,11 @@ function saveDailyRef(key, current, prevClose) {
 }
 
 // ─── CORS PROXY ───────────────────────────────────────────────────────────────
+// 1순위: 같은 도메인의 /api/proxy (Cloudflare Pages Function) — 가장 빠름
+// 2순위~: 공용 CORS 프록시 (로컬/타 호스팅 환경용 폴백)
 async function proxyFetch(url) {
   const proxies = [
+    u => `/api/proxy?url=${encodeURIComponent(u)}`,               // same-origin Pages Function
     u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
@@ -262,53 +271,50 @@ async function fetchUpbitUSDT() {
 }
 
 async function fetchFX() {
-  // Try Yahoo first to get real-time rate + prevClose baseline
-  let yahooCurrent = null, yahooPrev = null, yahooState = null;
-  try {
-    const meta = await fetchYahoo('USDKRW=X');
-    if (meta?.regularMarketPrice) {
-      yahooCurrent = meta.regularMarketPrice;
-      yahooPrev    = meta.chartPreviousClose || meta.previousClose || null;
-      yahooState   = meta.marketState || null;
-    }
-  } catch (e) { console.warn('[FX Yahoo]', e.message); }
+  // Fetch Yahoo (real FX) and Upbit (USDT/KRW, 24/7) in parallel
+  const [yahooRes, upbitRes] = await Promise.allSettled([
+    fetchYahoo('USDKRW=X'),
+    fetchUpbitUSDT(),
+  ]);
 
-  // If FX market is CLOSED, prefer Upbit's 24/7 live USDT/KRW as "current"
-  // (Yahoo's price stays frozen at Friday close on weekends)
-  if (yahooState === 'CLOSED' || yahooState === 'POSTPOST') {
-    const upbit = await fetchUpbitUSDT();
-    if (upbit && yahooCurrent) {
-      return {
-        current:     upbit,
-        prevClose:   yahooCurrent, // compare live crypto price vs last FX close
-        marketState: 'CRYPTO_247',
-      };
-    }
-  }
-  if (yahooCurrent) {
-    return { current: yahooCurrent, prevClose: yahooPrev, marketState: yahooState };
+  const meta  = yahooRes.status === 'fulfilled' ? yahooRes.value : null;
+  const upbit = upbitRes.status === 'fulfilled' ? upbitRes.value : null;
+
+  // Yahoo succeeded → actual FX rate
+  if (meta?.regularMarketPrice) {
+    const current   = meta.regularMarketPrice;
+    const prevClose = meta.chartPreviousClose || meta.previousClose || null;
+    const kimp = upbit ? (upbit / current - 1) * 100 : null;
+    return {
+      current, prevClose,
+      marketState: meta.marketState || null,
+      upbitUSDT: upbit, kimp,
+    };
   }
 
-  // Yahoo entirely failed — try Upbit standalone (24/7)
-  const upbit = await fetchUpbitUSDT();
-  if (upbit) return { current: upbit, prevClose: null, marketState: 'CRYPTO_247' };
-
-  // Fallback: Naver Finance FX
+  // Yahoo failed — try Naver FX
   try {
     const data = await proxyFetch('https://m.stock.naver.com/api/stock/FX_USDKRW/basic');
     const parseNum = s => s ? parseFloat(String(s).replace(/,/g,'')) : null;
     const current = parseNum(data?.closePrice || data?.nv);
     const change  = parseNum(data?.compareToPreviousClosePrice || data?.cv);
-    if (current) return { current, prevClose: (change != null) ? current - change : null, marketState: null };
+    if (current) {
+      const kimp = upbit ? (upbit / current - 1) * 100 : null;
+      return { current, prevClose: (change != null) ? current - change : null,
+               marketState: null, upbitUSDT: upbit, kimp };
+    }
   } catch (e) { console.warn('[FX Naver]', e.message); }
 
-  // Last resort: open.er-api.com (updates ~hourly)
+  // All real-FX sources failed — use Upbit (kimchi-premium-included) as last resort
+  if (upbit) return { current: upbit, prevClose: null, marketState: 'UPBIT_FALLBACK', upbitUSDT: upbit, kimp: null };
+
+  // Truly last resort: open.er-api.com
   const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw new Error(`FX HTTP ${r.status}`);
   const d = await r.json();
   const current = d?.rates?.KRW;
   if (!current) throw new Error('No KRW rate');
-  return { current, prevClose: null, marketState: null };
+  return { current, prevClose: null, marketState: null, upbitUSDT: null, kimp: null };
 }
 
 // ─── FETCH ALL ────────────────────────────────────────────────────────────────
@@ -328,9 +334,11 @@ async function fetchAllData() {
 
   // FX
   if (fxRes.status === 'fulfilled') {
-    const { current, prevClose: apiPrevClose, marketState } = fxRes.value;
+    const { current, prevClose: apiPrevClose, marketState, upbitUSDT, kimp } = fxRes.value;
     state.fx.current = current;
     state.fx.marketState = marketState;
+    state.fx.upbitUSDT = upbitUSDT;
+    state.fx.kimp = kimp;
     if (apiPrevClose) {
       state.fx.prevClose = apiPrevClose;
       saveDailyRef('tiger_fx_ref', current, apiPrevClose);
@@ -467,7 +475,10 @@ function buildETFCards() {
       </div>
       <!-- US Price row -->
       <div class="px-4 py-2 flex items-center justify-between border-b border-gray-50">
-        <span class="text-gray-500 text-xs">${p.usSymbol} <span id="us-label-${p.krCode}" class="text-gray-400"></span></span>
+        <div class="flex flex-col">
+          <span class="text-gray-500 text-xs">${p.usSymbol} <span id="us-label-${p.krCode}" class="text-gray-400"></span></span>
+          <span id="us-source-${p.krCode}" class="text-gray-300 text-[10px]">Yahoo Finance</span>
+        </div>
         <div class="text-right">
           <span id="us-price-${p.krCode}" class="font-bold text-gray-900 num">--</span>
           <span id="us-change-${p.krCode}" class="ml-2 text-sm num">--</span>
@@ -518,14 +529,14 @@ function buildETFCards() {
 }
 
 function renderFX() {
-  const { current, prevClose, pctChange, source, marketState } = state.fx;
+  const { current, prevClose, pctChange, source, marketState, upbitUSDT, kimp } = state.fx;
   setText('fx-current', current != null ? fmtFX(current) : '--');
   setText('fx-prev', prevClose != null ? fmtFX(prevClose) : '--');
-  let label = '실시간';
+  let label = '실시간 (Yahoo)';
   if (source === 'error') label = '⚠ 조회 실패';
-  else if (marketState === 'CRYPTO_247') label = '실시간 (Upbit USDT)';
+  else if (marketState === 'UPBIT_FALLBACK') label = '⚠ Upbit 대체 (김프 포함)';
   else if (marketState && marketState !== 'REGULAR') {
-    const map = { CLOSED:'장 마감 · 금요일 종가', PRE:'프리마켓', POST:'애프터마켓', PREPRE:'장 시작 전' };
+    const map = { CLOSED:'장 마감 · 전 거래일 종가', PRE:'프리마켓', POST:'애프터마켓', PREPRE:'장 시작 전' };
     label = map[marketState] || marketState;
   }
   setText('fx-source-label', label);
@@ -534,6 +545,18 @@ function renderFX() {
     el.textContent = fmtPct(pctChange);
     el.className = `text-sm font-medium num ${pctColor(pctChange)}`;
   }
+  // Upbit USDT + Kimchi Premium
+  setText('fx-upbit', upbitUSDT != null ? fmtFX(upbitUSDT) : '--');
+  const kimpEl = document.getElementById('fx-kimp');
+  if (kimpEl) {
+    kimpEl.textContent = kimp != null ? fmtPct(kimp) : '--';
+    // 김프 > 1% 빨강, < -1% 초록, 그 외 회색
+    kimpEl.className = `ml-1 font-semibold num ${
+      kimp == null ? 'text-gray-400'
+      : kimp > 1 ? 'text-red-600'
+      : kimp < -1 ? 'text-green-600'
+      : 'text-gray-700'}`;
+  }
 }
 
 function renderPair(ps) {
@@ -541,6 +564,11 @@ function renderPair(ps) {
   // US price
   setText(`us-price-${krCode}`, fmtUSD(ps.us.current));
   setText(`us-label-${krCode}`, ps.us.sessionLabel || '');
+  const usSourceEl = document.getElementById(`us-source-${krCode}`);
+  if (usSourceEl) {
+    usSourceEl.textContent = ps.us.source === 'error' ? '⚠ Yahoo 조회 실패' : 'Yahoo Finance';
+    usSourceEl.className = ps.us.source === 'error' ? 'text-red-400 text-[10px]' : 'text-gray-300 text-[10px]';
+  }
   const usChEl = document.getElementById(`us-change-${krCode}`);
   if (usChEl) { usChEl.textContent = fmtPct(ps.us.pctChange); usChEl.className = `text-sm num ${pctColor(ps.us.pctChange)}`; }
 
